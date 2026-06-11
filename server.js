@@ -28,8 +28,8 @@ const SOURCE_NUMBER = "OKNA PLAST";
 const SHOP_NAME     = "OKNA PLAST";
 
 // CRM webhook (отправка заявок в Google Apps Script CRM)
-const CRM_WEBHOOK_URL    = process.env.CRM_WEBHOOK_URL || "";
-const CRM_WEBHOOK_SECRET = process.env.CRM_WEBHOOK_SECRET || "";
+const CRM_WEBHOOK_URL    = process.env.CRM_WEBHOOK_URL || "https://script.google.com/macros/s/AKfycbwojTX7O0UaOmE4K4EqDmEsrCXxyJTj6MYHmzv1eDalDGeJOr8s034sp4UGmer6BFkG/exec";
+const CRM_WEBHOOK_SECRET = process.env.CRM_WEBHOOK_SECRET || "hubmaster_crm_2026";
 const CRM_SEND_UPDATES   = String(process.env.CRM_SEND_UPDATES || "false").toLowerCase() === "true";
 
 // ── PostgreSQL ──────────────────────────────────────────────
