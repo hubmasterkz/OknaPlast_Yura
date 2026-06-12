@@ -688,6 +688,33 @@ function isThanksClose(text) {
 async function notifyRefusal(phone, waited) {
   const a = await analyzeDialog(phone);
   if (isThanksClose(a.last)) { console.log("⏭️ отказ пропущен — клиент попрощался:", phone, "|", a.last); return; }
+
+  // ДЕДУП ОТКАЗА: отказ фиксируется ОДИН раз на клиента.
+  // 1) если по клиенту уже был отказ (когда-либо) — повторный НЕ создаём;
+  // 2) если по клиенту недавно (7 дней) была жалоба — дело уже у людей, отказ НЕ создаём.
+  // Если клиент снова пишет — это обработается как новая заявка/жалоба обычным потоком (askClaude),
+  // а НЕ как ещё один отказ.
+  try {
+    const prevRef = await pool.query(
+      "SELECT 1 FROM leads WHERE phone=$1 AND bot=$2 AND type='refusal' LIMIT 1",
+      [phone, BOT_NAME]
+    );
+    if (prevRef.rowCount > 0) {
+      console.log("⏭️ отказ пропущен — по клиенту уже зафиксирован отказ:", phone);
+      return;
+    }
+    const prevCompl = await pool.query(
+      "SELECT 1 FROM complaints WHERE phone=$1 AND bot=$2 AND date > NOW() - INTERVAL '7 days' LIMIT 1",
+      [phone, BOT_NAME]
+    );
+    if (prevCompl.rowCount > 0) {
+      console.log("⏭️ отказ пропущен — по клиенту есть недавняя жалоба:", phone);
+      return;
+    }
+  } catch (e) {
+    console.error("refusal dedup check error:", e.message);
+    // при ошибке проверки фиксируем как раньше (видимость важнее), 1-часовая защита в таймере остаётся
+  }
   let refusalGlobalId = null;
   try {
     const raw = "Направление: " + a.direction + "\nУслуга: " + a.service + "\nПричина: " + a.reason + "\nПоследнее: " + (a.last || "—");
