@@ -440,7 +440,7 @@ async function saveLead(phone, replyText) {
 
   console.log(`✅ Новая заявка #${globalId} (№${todayCount} за сегодня) от ${phone}`);
   notifyNewLead(phone, cleanLead, todayCount, globalId);
-  await sendLeadToCrm(phone, cleanLead, todayCount, globalId, "new_lead");
+  sendLeadToCrm(phone, cleanLead, todayCount, globalId, "new_lead").catch(e => console.error("CRM async error:", e.message)); // в фоне — не тормозим ответ клиенту
 }
 
 async function saveCallback(phone, replyText) {
@@ -663,6 +663,14 @@ async function analyzeDialog(phone) {
 
 async function sendFollowup(phone) {
   if (followupSent[phone]) return false; // уже слали — не повторяем
+  // Если клиент уже оформил заявку/звонок (за сутки) — не доставать follow-up'ом «записать?»
+  try {
+    const hasLead = await pool.query(
+      "SELECT 1 FROM leads WHERE phone=$1 AND bot=$2 AND type IN ('lead','callback') AND date > NOW() - INTERVAL '24 hours' LIMIT 1",
+      [phone, BOT_NAME]
+    );
+    if (hasLead.rowCount > 0) { console.log("⏭️ follow-up пропущен — заявка уже оформлена:", phone); return false; }
+  } catch (e) { console.error("followup lead-check error:", e.message); }
   const hist = await loadHistory(phone);
   const lastUser = hist.filter(m => m.role === "user").slice(-1)[0];
   const lastTxt = lastUser && typeof lastUser.content === "string" ? lastUser.content : "";
@@ -715,6 +723,8 @@ async function notifyRefusal(phone, waited) {
     console.error("refusal dedup check error:", e.message);
     // при ошибке проверки фиксируем как раньше (видимость важнее), 1-часовая защита в таймере остаётся
   }
+
+  console.log("🔴 Отказ зафиксирован для " + phone); // сюда код доходит ТОЛЬКО если дедуп пройден
   let refusalGlobalId = null;
   try {
     const raw = "Направление: " + a.direction + "\nУслуга: " + a.service + "\nПричина: " + a.reason + "\nПоследнее: " + (a.last || "—");
@@ -800,6 +810,16 @@ function buildSystemPrompt(clientCtx, knowledge) {
 - Если клиент назвал количество — не уточняй количество повторно.
 - Никогда не пиши маркированные списки с буллетами (•, -, *) — только обычный текст.
 - Скидку упоминай один раз вскользь — не делай из неё отдельный абзац.
+
+НЕ ПЕРЕСПРАШИВАЙ УЖЕ СКАЗАННОЕ (ВАЖНО)
+Внимательно читай ВСЮ переписку перед ответом. Если клиент уже назвал имя, телефон, город, адрес, этаж, количество окон/изделий, тип сетки или удобное время — считай это ИЗВЕСТНЫМ и больше НЕ спрашивай повторно. Бери уже названные значения и подставляй в [ЗАЯВКА].
+Клиент часто даёт данные частями (адрес в одном сообщении, этаж в другом) — собирай их вместе, не переспрашивая заново.
+Спрашивай ТОЛЬКО то, чего реально не хватает. Лишний повторный вопрос раздражает и роняет заявку.
+
+НЕ ТОПЧИСЬ НА АДРЕСЕ — ОФОРМЛЯЙ ЗАЯВКУ (ВАЖНО)
+Точный адрес (дом, блок, квартира, этаж) для оформления [ЗАЯВКА] НЕ обязателен — его уточнит менеджер при звонке. Достаточно города и, если клиент назвал, ЖК/района.
+Как только есть имя, телефон (или «этот номер»), город и понятная услуга — СРАЗУ оформляй [ЗАЯВКА]. В поле Адрес пиши что есть (ЖК/район или «уточнит менеджер»).
+НЕ переспрашивай и НЕ подтверждай адрес повторно. Максимум одно короткое уточнение — и оформляй. Цикл «подтвердите адрес» теряет горячего клиента.
 
 О КОМПАНИИ
 OKNA PLAST — изготовление и установка окон, москитных сеток, решёток, ремонт окон и пластиковых дверей (регулировка, замена уплотнителя) по Казахстану. Гарантия 12 месяцев, выезд в день обращения. Замер сеток, решёток и ремонта бесплатный; замер для изготовления окон — платный (см. ниже).
@@ -1031,6 +1051,14 @@ async function askClaude(userPhone, userMessage, imageBase64, imageMediaType) {
 }
 
 // ── WhatsApp отправка через Wazzup (с retry) ─────────────────
+// ── Вырезание служебных тегов из сообщения клиенту ────────────
+// В Telegram/БД уходит полный reply (с тегами — их парсят saveLead и т.п.),
+// а клиенту в WhatsApp шлём только видимую часть ДО первого тега.
+function stripTags(text) {
+  const visible = (text || "").split(/\[(?:ЗАЯВКА|ПОЗВОНИТЬ|ЖАЛОБА)\]/)[0].trim();
+  return visible || "Готово! Передал менеджеру — он скоро свяжется 😊";
+}
+
 async function sendWhatsApp(to, text, attempt = 1) {
   try {
     await axios.post(
@@ -1152,7 +1180,6 @@ function resetRejectTimer(from) {
         const r2 = await pool.query("SELECT 1 FROM leads WHERE phone=$1 AND bot=$2 AND date > NOW() - INTERVAL '1 hour' LIMIT 1", [from, BOT_NAME]);
         if (r2.rowCount > 0) return;
         await notifyRefusal(from, "молчит после follow-up (40 мин)");
-        console.log("🔴 Отказ зафиксирован для " + from);
       } catch (e) { console.error("Refusal timer error:", e.message); }
     }, REFUSAL_MS);
   }, FOLLOWUP_MS);
@@ -1169,7 +1196,7 @@ function bufferIncoming(from, text) {
     delete messageBuffers[from];
     try {
       const reply = await askClaude(from, combined);
-      await sendWhatsApp(from, reply);
+      await sendWhatsApp(from, stripTags(reply));
       if (!reply.includes("[ЗАЯВКА]") && !reply.includes("[ПОЗВОНИТЬ]")) {
         resetRejectTimer(from);
       } else {
@@ -1201,7 +1228,7 @@ async function handleImage(from, message) {
     const mediaType = imgResp.headers["content-type"] || "image/jpeg";
     const userText = caption || "Клиент прислал фото — посмотри что на нём и помоги.";
     const reply = await askClaude(from, userText, base64, mediaType);
-    await sendWhatsApp(from, reply);
+    await sendWhatsApp(from, stripTags(reply));
   } catch (err) {
     console.error("Image error:", err.message);
     await sendWhatsApp(from, "Не получилось загрузить фото 🙏 Напишите размеры текстом — помогу.");
